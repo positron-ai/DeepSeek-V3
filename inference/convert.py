@@ -31,7 +31,7 @@ mapping = {
 }
 
 
-def main(hf_ckpt_path, save_path, n_experts, mp):
+def main(hf_ckpt_path, save_path, n_experts, n_layers, mp):
     """
     Converts and saves model checkpoint files into a specified format.
 
@@ -55,7 +55,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                 m = re.match(regex, name)
                 if m:
                     layer = int(m.group(1))
-                    if layer >= 4: continue
+                    if layer >= n_layers: continue
                 print(f"Processing {name}")
                 if "model.layers.61" in name:
                     continue
@@ -97,7 +97,8 @@ if __name__ == "__main__":
     parser.add_argument("--hf-ckpt-path", type=str, required=True)
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--n-experts", type=int, required=True)
+    parser.add_argument("--n-layers", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
-    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)
+    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.n_layers, args.model_parallel)
