@@ -1,3 +1,4 @@
+import re
 import os
 import shutil
 from argparse import ArgumentParser
@@ -50,6 +51,12 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
+                regex = "model.layers.([0-9]+)."
+                m = re.match(regex, name)
+                if m:
+                    layer = int(m.group(1))
+                    if layer >= 4: continue
+                print(f"Processing {name}")
                 if "model.layers.61" in name:
                     continue
                 param: torch.Tensor = f.get_tensor(name)
