@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from kernel import act_quant, weight_dequant, fp8_gemm
+from logging_utils import ValueLogger
 
 
 world_size = 1
@@ -134,16 +135,16 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     Args:
         x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and 
+        weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve 
+        torch.Tensor: The result of the linear transformation, which may involve
         quantization-aware computations depending on the input parameters.
 
     Notes:
-        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version 
+        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version
           is used for computation.
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
@@ -440,7 +441,8 @@ class MLA(nn.Module):
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor,
+                mask: Optional[torch.Tensor], logger: Optional[ValueLogger], layer: Optional[int] = None):
         """
         Forward pass for the Multi-Headed Attention Layer (MLA).
 
@@ -449,6 +451,8 @@ class MLA(nn.Module):
             start_pos (int): Starting position in the sequence for caching.
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            logger (Optional[ValueLogger]): Logger for logging intermediate values.
+            layer (Optional[int]): Layer index in the transformer.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
@@ -462,6 +466,11 @@ class MLA(nn.Module):
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # Log query vectors
+        if logger:
+            logger.log_value_for_sequence("Q non-positional", q_nope, layer)
+            logger.log_value_for_sequence("Q positional", q_pe, layer)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
@@ -471,11 +480,17 @@ class MLA(nn.Module):
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+
+            # Log key and value vectors
+            if logger:
+                logger.log_value_for_sequence("K non-positional", k_nope, layer)
+                logger.log_value_for_sequence("K positional", k_pe, layer)
+                logger.log_value_for_sequence("V", v, layer)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
@@ -485,12 +500,22 @@ class MLA(nn.Module):
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+
+        # Log attention scores
+        if logger:
+            logger.log_value_for_sequence("Attention scores", scores, layer)
+
         if attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         x = self.wo(x.flatten(2))
+
+        # Log output
+        if logger:
+            logger.log_value_for_sequence("WO", x, layer)
+
         return x
 
 
@@ -503,30 +528,45 @@ class MLP(nn.Module):
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
         w3 (nn.Module): Additional linear layer for feature transformation.
     """
-    def __init__(self, dim: int, inter_dim: int):
+    def __init__(self, layer_id: int, dim: int, inter_dim: int):
         """
         Initializes the MLP layer.
 
         Args:
+            layer_id (int): Layer index in the transformer.
             dim (int): Input and output dimensionality.
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
+        self.layer_id = layer_id
         self.w1 = ColumnParallelLinear(dim, inter_dim)
         self.w2 = RowParallelLinear(inter_dim, dim)
         self.w3 = ColumnParallelLinear(dim, inter_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, logger: Optional[ValueLogger] = None) -> torch.Tensor:
         """
         Forward pass for the MLP layer.
 
         Args:
             x (torch.Tensor): Input tensor.
+            logger (Optional[ValueLogger]): Logger for logging intermediate values.
 
         Returns:
             torch.Tensor: Output tensor after MLP computation.
         """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        w1_out = self.w1(x)
+        w3_out = self.w3(x)
+        if logger:
+            logger.log_value_for_sequence("WFF1", w1_out, self.layer_id)
+            logger.log_value_for_sequence("WFF3", w3_out, self.layer_id)
+
+        silu_out = F.silu(w1_out)
+        prod = silu_out * w3_out
+        out = self.w2(prod)
+        if logger:
+            logger.log_value_for_sequence("WFF2", out, self.layer_id)
+
+        return out
 
 
 class Gate(nn.Module):
@@ -617,17 +657,19 @@ class Expert(nn.Module):
         self.w2 = Linear(inter_dim, dim)
         self.w3 = Linear(dim, inter_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the Expert layer.
+    def forward(self, x: torch.Tensor, logger: Optional[ValueLogger] = None,
+                layer: Optional[int] = None, expert: Optional[int] = None) -> torch.Tensor:
+        w1_out = self.w1(x)
+        w3_out = self.w3(x)
+        if logger:
+            logger.log_value_for_sequence("WFF1", w1_out, layer, expert)
+            logger.log_value_for_sequence("WFF3", w3_out, layer, expert)
 
-        Args:
-            x (torch.Tensor): Input tensor.
+        silu_out = F.silu(w1_out)
+        prod = silu_out * w3_out
+        out = self.w2(prod)
 
-        Returns:
-            torch.Tensor: Output tensor after expert computation.
-        """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return out
 
 
 class MoE(nn.Module):
@@ -643,14 +685,16 @@ class MoE(nn.Module):
         experts (nn.ModuleList): List of expert modules.
         shared_experts (nn.Module): Shared experts applied to all inputs.
     """
-    def __init__(self, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs):
         """
         Initializes the MoE module.
 
         Args:
+            layer_id (int): Layer index in the transformer.
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+        self.layer_id = layer_id
         self.dim = args.dim
         assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
         self.n_routed_experts = args.n_routed_experts
@@ -660,22 +704,18 @@ class MoE(nn.Module):
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(args)
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
-                                      for i in range(self.n_routed_experts)])
-        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+                                    for i in range(self.n_routed_experts)])
+        self.shared_experts = MLP(layer_id, args.dim, args.n_shared_experts * args.moe_inter_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after expert routing and computation.
-        """
+    def forward(self, x: torch.Tensor, logger: Optional[ValueLogger] = None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
+
+        if logger:
+            logger.log_value_for_sequence("Gate weights", weights, self.layer_id)
+            logger.log_value_for_sequence("Gate indices", indices, self.layer_id)
+
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
@@ -683,10 +723,18 @@ class MoE(nn.Module):
                 continue
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+            expert_out = expert(x[idx], logger, self.layer_id, i)
+            if logger:
+                logger.log_value_for_sequence("WFF2", expert_out, self.layer_id, i)
+            y[idx] += expert_out * weights[idx, top, None]
+
         z = self.shared_experts(x)
+        if logger:
+            logger.log_value_for_sequence("Shared experts output", z, self.layer_id)
+
         if world_size > 1:
             dist.all_reduce(y)
+
         return (y + z).view(shape)
 
 
@@ -709,12 +757,13 @@ class Block(nn.Module):
             args (ModelArgs): Model arguments containing block parameters.
         """
         super().__init__()
+        self.layer_id = layer_id
         self.attn = MLA(args)
-        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.ffn = MLP(layer_id, args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(layer_id, args)
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], logger: Optional[ValueLogger]) -> torch.Tensor:
         """
         Forward pass for the Transformer block.
 
@@ -723,12 +772,21 @@ class Block(nn.Module):
             start_pos (int): Starting position in the sequence.
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            logger (Optional[ValueLogger]): Logger for logging intermediate values.
 
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
-        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
-        x = x + self.ffn(self.ffn_norm(x))
+        h = self.attn_norm(x)
+        if logger:
+            logger.log_value_for_sequence("Pre-attention norm", h, self.layer_id)
+        h = self.attn(h, start_pos, freqs_cis, mask, logger, self.layer_id)
+        x = x + h
+
+        h = self.ffn_norm(x)
+        if logger:
+            logger.log_value_for_sequence("Post-attn RMSNorm", h, self.layer_id)
+        x = x + self.ffn(h, logger)
         return x
 
 
@@ -743,13 +801,15 @@ class Transformer(nn.Module):
         norm (nn.Module): Layer normalization applied after all blocks.
         head (nn.Module): Output projection layer mapping to vocabulary size.
         freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+        logger (Optional[ValueLogger]): Logger for logging intermediate values.
     """
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, logger: Optional[ValueLogger] = None):
         """
         Initializes the Transformer model.
 
         Args:
             args (ModelArgs): Model arguments containing transformer parameters.
+            logger (Optional[ValueLogger]): Logger for logging intermediate values.
         """
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -764,6 +824,7 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.logger = logger
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
@@ -779,18 +840,39 @@ class Transformer(nn.Module):
         """
         seqlen = tokens.size(1)
         h = self.embed(tokens)
+
+        # Log embeddings for each token
+        if self.logger:
+            self.logger.log_value_for_sequence("Embedding", h)
+
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
+            h = layer(h, start_pos, freqs_cis, mask, self.logger)
+
+        if self.logger:
+            self.logger.log_value_for_sequence("Un-normalized final embedding", h)
+
+        h = self.norm(h)
+        # Log final norm for each token
+        if self.logger:
+            self.logger.log_value_for_sequence("Final embedding", h)
+
+        h = h[:, -1]
         logits = self.head(h)
+
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
+
+        # Log final logits
+        if self.logger:
+            self.logger.log_value("logits", logits[0], seqlen-1)
+
         return logits
 
 
