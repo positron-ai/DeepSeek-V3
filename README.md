@@ -27,3 +27,19 @@ I believe DeepSeek's original purpose for the conversion script was to
 create sharded weight sets to be able to run the model distributed
 with `torchrun`, but as long as we're willing to limit the number of
 layers we don't need to do that.
+
+## Step 2: Generate
+
+```
+# On a machine with some GPUs
+cd inference
+python3 generate.py \
+  --ckpt-path /opt/positron/weights/huggingface/positron-ai/DeepSeek-V3-pt-converted-4-layers/ \
+  --config configs/config_671B_4_layers.json \
+  --input-file requirements.txt \
+  --max-new-tokens 10
+```
+
+The input file is just something I happened to have handy.  Looks like
+the driver script will interpret each line of that file as a separate
+prompt and try to complete all of them.
