@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from safetensors.torch import load_model
 
 from model import Transformer, ModelArgs
+from logging_utils import ValueLogger
 
 
 def sample(logits, temperature: float = 1.0):
@@ -85,6 +86,7 @@ def main(
     interactive: bool = True,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
+    log_file: str = "",
 ) -> None:
     """
     Main function to load the model and perform interactive or batch text generation.
@@ -96,6 +98,7 @@ def main(
         interactive (bool, optional): Whether to run in interactive mode. Defaults to True.
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
+        log_file (str, optional): Path to a file for logging values. Defaults to "".
     """
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -112,8 +115,14 @@ def main(
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
+
+    # Create logger if log file is specified
+    logger = None
+    if log_file and rank == 0:
+        logger = ValueLogger(log_file)
+
     with torch.device("cuda"):
-        model = Transformer(args)
+        model = Transformer(args, logger)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
@@ -180,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--log-file", type=str, default="")
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.log_file)
