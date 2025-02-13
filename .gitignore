@@ -169,4 +169,7 @@ cython_debug/
 
 .vscode/*
 
+# Cursor IDE
+.cursor/
+
 .DS_Store
